@@ -32,14 +32,20 @@ def lambda_handler(event, context):
     pdf_bytes = _render_pdf(therapeutic_area, ranked_opportunities)
 
     key = f"reports/{therapeutic_area.lower()}/{uuid.uuid4()}.pdf"
+    s3_error = None
     if BUCKET:
-        s3.put_object(Bucket=BUCKET, Key=key, Body=pdf_bytes, ContentType="application/pdf")
+        try:
+            s3.put_object(Bucket=BUCKET, Key=key, Body=pdf_bytes, ContentType="application/pdf")
+        except Exception as exc:
+            s3_error = str(exc)
+            key = None
 
     return {
         "tool": "compose_pdf_report",
         "therapeutic_area": therapeutic_area,
-        "report_s3_key": key if BUCKET else None,
+        "report_s3_key": key,
         "opportunity_count": len(ranked_opportunities),
+        **({"s3_error": s3_error} if s3_error else {}),
         "disclaimer": (
             "This is a decision-support prioritization draft, not a "
             "guarantee of drug success, a clinical prediction, or a "

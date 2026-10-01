@@ -1,109 +1,167 @@
-# TheraScout — AI-Powered Therapeutic Opportunity Intelligence
+# TheraScout
 
-This repository is the Build-phase implementation of TheraScout, structured to match the
-architecture and agent-pipeline diagrams from the Solution Proposal.
+**Agentic AI platform for pharmaceutical R&D opportunity prioritization.**
 
-## How this maps to the diagrams
+TheraScout takes a therapeutic area (e.g., Colorectal Cancer) and deploys four specialized AI agents in parallel to gather data from GLOBOCAN, PubMed, ClinicalTrials.gov, and openFDA. Amazon Nova Pro (via Bedrock) synthesizes the findings and ranks the **Top 5 therapeutic research opportunities** using a six-dimension weighted scoring model.
 
-- **Layered architecture diagram** (Client / Application & Orchestration / AI Services / Data)
-  → `frontend/`, `backend/`, `agents/` + `orchestration/`, `infra/stacks/data_stack.py`
-- **Agent pipeline diagram** (ingest → decision → analyze → gap_score → report)
-  → `orchestration/statemachine.asl.json` — every box in that diagram is a state in this file
-- **Tool boxes above each agent** → `tools/*/handler.py` — one Lambda per tool
-- **Broadcast / gather pattern** (6 agents in parallel) → the `Parallel` state in the state
-  machine, calling the 6 agents in `agents/`
+---
 
-## Folder structure
+## Architecture
 
 ```
-therascout/
-├── infra/                     AWS CDK app — deploys everything below
-│   ├── app.py                 CDK entry point
-│   └── stacks/
-│       ├── data_stack.py      S3, OpenSearch Serverless, RDS PostgreSQL
-│       ├── agent_stack.py     Lambda tools + IAM roles
-│       └── orchestration_stack.py   Step Functions state machine + API Gateway
-│
-├── tools/                     One Lambda per "tool box" in the pipeline diagram
-│   ├── query_globocan_data/   Disease Agent's tool (reads a cached S3 export — GLOBOCAN has no live API)
-│   ├── query_pubmed/          Research Agent's tool
-│   ├── query_clinicaltrials/  Clinical Trial Agent's tool
-│   ├── query_openfda/         Treatment Agent's tool
-│   ├── check_data_scope/      Ingest step's decision logic
-│   ├── enrich_enterprise_data/  Mocked enterprise data source (the "no" branch)
-│   └── compose_pdf_report/    Report Composer (ReportLab)
-│
-├── agents/                     AgentCore harness configs — one per specialist agent
-│   ├── disease_agent/
-│   ├── treatment_agent/
-│   ├── research_agent/
-│   ├── clinical_trial_agent/
-│   ├── competition_agent/
-│   ├── trend_agent/
-│   ├── gap_scoring_agent/      Combines all 6 outputs, ranks Top 5–6
-│   └── orchestrator/           Top-level agent that the state machine invokes first
-│
-├── orchestration/
-│   └── statemachine.asl.json  The full pipeline as Amazon States Language
-│
-├── backend/                    FastAPI — the Application layer
-│   ├── main.py
-│   └── routers/scan.py         POST /scan, GET /scan/{id}
-│
-├── frontend/                   React — the Client layer
-│   └── src/App.jsx
-│
-├── data/
-│   └── scoring_weights.json   The Opportunity Score weighting formula
-│
-└── tests/
-    └── test_query_globocan_data.py
+User selects therapeutic area
+        │
+        ▼
+FastAPI Backend (scan.py)
+        │  starts execution
+        ▼
+AWS Step Functions ── parallel ──┬── Disease Agent    (GLOBOCAN / WHO data)
+                                 ├── Treatment Agent  (openFDA drug labels)
+                                 ├── Research Agent   (PubMed publications)
+                                 └── Clinical Trial Agent (ClinicalTrials.gov)
+                                              │
+                                              ▼
+                              Amazon Nova Pro (Bedrock Converse API)
+                              Scores & ranks Top 5 opportunities
+                                              │
+                                              ▼
+                              React Frontend — card-based results UI
 ```
 
-## MVP scope: Colorectal Cancer, not "Oncology" broadly
+---
 
-"Oncology" spans dozens of distinct diseases with very different data
-volumes. This MVP is scoped to **Colorectal Cancer** specifically — large
-enough dataset across all four sources to produce a real demo, without
-being so broad the agents return an unfocused result set. Extending to
-additional cancer types is a matter of (a) uploading their GLOBOCAN
-export and (b) adding them to `check_data_scope`'s known-areas set — not
-a redesign.
+## Prerequisites
 
-## A correction worth knowing about
+| Tool | Version | Notes |
+|---|---|---|
+| Python | 3.10+ | Backend + CDK |
+| Node.js | 18+ | Frontend (Vite + React) |
+| AWS CDK | 2.x | `npm install -g aws-cdk` |
+| saml2aws | 2.36.x | For Cognizant SSO login |
+| AWS CLI | 2.x | Used by CDK and boto3 |
 
-An earlier version of this project called the general **WHO GHO OData
-API** for disease burden data. That API is real, but it does not carry
-cancer-specific incidence/mortality by cancer type — that data lives in
-**IARC's GLOBOCAN**, published through the Global Cancer Observatory
-("Cancer Today"). GLOBOCAN has no public REST API, so
-`tools/query_globocan_data/` reads from a periodically-refreshed export
-cached in S3 instead of a live call — see that file's docstring for the
-full explanation and the manual export step required.
+---
 
+## AWS Setup (one-time)
 
+### 1. Refresh your SAML token
 
-This matches the milestone plan from the Solution Proposal:
+Your AWS credentials expire every ~6 hours. Before running the backend or deploying, log in:
 
-1. `tools/query_pubmed/handler.py` — get one live-API tool working standalone first (simplest to test — no S3 caching step). `tools/query_globocan_data/handler.py` has a different pattern: it reads a cached S3 export since GLOBOCAN has no public API — upload one export manually before testing it.
-2. `agents/disease_agent/` — wire that tool into one real AgentCore agent, test with `agentcore dev`
-3. `orchestration/statemachine.asl.json` — wire ingest → decision → Disease Agent only → stop
-4. Duplicate the pattern for the other five agents
-5. `agents/gap_scoring_agent/` and `tools/compose_pdf_report/`
-6. `backend/` then `frontend/` — build the UI last, once the pipeline works headlessly
+```powershell
+cd "C:\Users\2469312\OneDrive - Cognizant\Desktop\build a thon\saml2aws_2.36.19_windows_amd64"
+.\saml2aws.exe login
+```
 
-## Deploying
+This writes temporary credentials to the `saml` profile in `~/.aws/credentials`.
 
-```bash
+### 2. Deploy infrastructure to AWS
+
+```powershell
 cd infra
 pip install -r requirements.txt
-cdk bootstrap aws://<ACCOUNT_ID>/us-east-1
+cdk bootstrap
 cdk deploy --all
 ```
 
-## What is mocked in this MVP
+After deploy, `deploy.ps1` writes the `STATE_MACHINE_ARN` to your `.env` automatically.
 
-- `tools/enrich_enterprise_data/` is a stub — real enterprise data integration is a Phase 2 item,
-  not part of this public-data MVP.
-- Model access assumes **OpenAI gpt-oss-120b** (`openai.gpt-oss-120b-1:0`) is enabled in Bedrock model access for your account. Enable it in the Bedrock console → Model access before deploying.
-- For local development, copy your Bedrock API key into `.env` as `BEDROCK_API_KEY=<key>` — see `.env` for the current key.
+---
+
+## Running Locally
+
+### Step 1 — Environment files
+
+```bash
+# Root .env (backend + AWS)
+cp .env.example .env
+# Edit .env: set STATE_MACHINE_ARN from cdk_outputs.json after deploying
+
+# Frontend .env
+cp frontend/.env.example frontend/.env
+# Default VITE_API_BASE=http://localhost:8000 works for local dev
+```
+
+### Step 2 — Backend
+
+```bash
+cd backend
+pip install -r requirements.txt
+python -m uvicorn main:app --reload
+```
+
+Backend runs at `http://localhost:8000`.  
+Swagger docs: `http://localhost:8000/docs`
+
+> **Token expired?** Run `saml2aws login` (Step 1 above) and restart the backend — no `--reload` needed, restart fully.
+
+### Step 3 — Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Frontend runs at `http://localhost:5173`.
+
+---
+
+## Scoring Model
+
+Each opportunity is scored across six dimensions:
+
+| Dimension | Weight |
+|---|---|
+| Unmet Medical Need | 30% |
+| Disease Burden | 20% |
+| Existing Treatment Gap | 20% |
+| Scientific Evidence | 15% |
+| Research Momentum | 10% |
+| Competitive Landscape | 5% |
+
+Scoring is performed by **Amazon Nova Pro** (`amazon.nova-pro-v1:0`) via the Bedrock Converse API from the FastAPI backend (SAML credentials). A deterministic fallback runs if Bedrock is unavailable.
+
+---
+
+## Data Sources
+
+| Agent | Source |
+|---|---|
+| Disease Agent | IARC GLOBOCAN 2022 (WHO cancer burden data) |
+| Treatment Agent | openFDA drug label API |
+| Research Agent | PubMed / NCBI Entrez API |
+| Clinical Trial Agent | ClinicalTrials.gov API v2 |
+
+---
+
+## Project Structure
+
+```
+TheraScout_Project/
+├── backend/              # FastAPI app
+│   ├── main.py
+│   └── routers/
+│       └── scan.py       # Step Functions + Bedrock scoring
+├── frontend/             # React + Vite
+│   └── src/App.jsx       # Card-based results UI
+├── tools/                # Lambda handler functions
+│   ├── query_globocan_data/
+│   ├── query_pubmed/
+│   ├── query_clinicaltrials/
+│   ├── query_openfda/
+│   ├── score_opportunities_fallback/
+│   └── compose_pdf_report/
+├── infra/                # AWS CDK stacks
+│   └── stacks/
+│       ├── data_stack.py
+│       └── agent_stack.py
+├── .env.example          # Copy to .env — never commit .env
+└── README.md
+```
+
+---
+
+## Disclaimer
+
+TheraScout output is a **decision-support draft**, not a clinical prediction, regulatory guidance, or guarantee of drug success. A human researcher must review and validate all results before any resource is committed.

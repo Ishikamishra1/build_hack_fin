@@ -1,28 +1,22 @@
 """
-score_opportunities_fallback — a Bedrock-free stand-in for gap_scoring_agent.
+gap_scoring_agent — Gap Analysis & Opportunity Scoring Engine.
 
-WHY THIS EXISTS: the gap_scoring_agent needs bedrock:InvokeModel, which is
-currently denied org-wide by a Service Control Policy. Every other stage of
-the pipeline (the four data tools, the scope check, the report composer)
-needs no model access at all, so this deterministic scorer lets the whole
-ingest -> analyze -> score -> report pipeline run and demo end-to-end while
-that policy exception is pending.
+Uses Amazon Bedrock (Claude Sonnet 5 / configurable via BEDROCK_MODEL_ID) to
+reason over the six specialist agents' findings, identify unmet-need
+intersections, and rank the Top 5-6 therapeutic opportunities with explainable
+scores and evidence-backed rationales.
 
-THIS IS NOT LLM REASONING. It applies the weights in data/scoring_weights.json
-to countable signals in the six agents' outputs. It cannot identify a novel
-opportunity or explain one in natural language -- it ranks the evidence it can
-count. Every output is tagged "method": "deterministic_fallback" so a demo
-never misrepresents it as agent reasoning.
-
-To switch back once Bedrock is available, repoint the state machine's
-Agent_GapAnalysisAndScoring state at ${InvokeAgentCoreAgentArn} (the original
-Parameters block is preserved in a comment in statemachine.asl.json).
+Falls back to the deterministic weighted scorer if Bedrock is unavailable,
+so the pipeline always produces a result.
 """
 import json
 import os
+import boto3
+from botocore.exceptions import ClientError
 
-# Injected at synth time by AgentStack from data/scoring_weights.json, so the
-# weighting formula has exactly one source of truth.
+_REGION = os.environ.get("AWS_REGION", "us-east-1")
+_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-3-5-sonnet-20241022-v2:0")
+
 _DEFAULT_WEIGHTS = {
     "unmet_medical_need": 0.30,
     "disease_burden": 0.20,
@@ -33,29 +27,13 @@ _DEFAULT_WEIGHTS = {
 }
 
 DISCLAIMER = (
-    "This is a decision-support prioritization metric, not a guarantee of "
-    "drug success, a clinical prediction, or a regulatory prediction. Scores "
-    "on this run were produced by a deterministic fallback scorer, not by an "
-    "LLM agent."
+    "This is a decision-support prioritization draft, not a guarantee of "
+    "drug success, a clinical prediction, or a regulatory prediction. A "
+    "human researcher must review and validate before any resource is committed."
 )
 
 
-def _weights() -> dict:
-    raw = os.environ.get("SCORING_WEIGHTS")
-    if not raw:
-        return _DEFAULT_WEIGHTS
-    try:
-        return json.loads(raw).get("weights", _DEFAULT_WEIGHTS)
-    except (TypeError, ValueError):
-        return _DEFAULT_WEIGHTS
-
-
 def lambda_handler(event, context):
-    """
-    Input: the Parallel state's output -- a list of the six agents' results,
-    in branch order (disease, treatment, research, clinical_trial,
-    competition, trend). Tolerates a dict-wrapped payload too.
-    """
     findings = event.get("agent_findings", event) if isinstance(event, dict) else event
     if not isinstance(findings, list):
         findings = [findings]
@@ -65,6 +43,124 @@ def lambda_handler(event, context):
         if isinstance(item, dict) and item.get("agent"):
             by_agent.setdefault(item["agent"], item)
 
+    therapeutic_area = next(
+        (v.get("therapeutic_area") for v in by_agent.values() if v.get("therapeutic_area")),
+        "Unknown",
+    )
+
+    try:
+        result = _score_with_bedrock(therapeutic_area, by_agent)
+        result["method"] = "bedrock_llm"
+        result["model"] = _MODEL_ID
+    except Exception as exc:
+        result = _score_deterministic(therapeutic_area, by_agent)
+        result["bedrock_error"] = str(exc)
+
+    result["agents_seen"] = sorted(by_agent)
+    result["disclaimer"] = DISCLAIMER
+    return result
+
+
+def _score_with_bedrock(therapeutic_area: str, by_agent: dict) -> dict:
+    prompt = _build_prompt(therapeutic_area, by_agent)
+    raw_text = _invoke_bedrock(prompt)
+    return _parse_llm_response(raw_text, therapeutic_area)
+
+
+def _build_prompt(therapeutic_area: str, by_agent: dict) -> str:
+    def fmt_records(agent_key: str, label: str) -> str:
+        agent = by_agent.get(agent_key, {})
+        records = agent.get("records", [])
+        insights = agent.get("llm_insights", "")
+        lines = [f"=== {label} ==="]
+        if insights:
+            lines.append(f"Agent analysis: {insights}")
+        if records:
+            lines.append(f"Records retrieved: {len(records)}")
+            for r in records[:5]:
+                lines.append(f"  - {json.dumps(r, default=str)[:200]}")
+        else:
+            lines.append("No records retrieved.")
+        return "\n".join(lines)
+
+    sections = "\n\n".join([
+        fmt_records("disease_agent", "DISEASE AGENT — Global disease burden (GLOBOCAN)"),
+        fmt_records("treatment_agent", "TREATMENT AGENT — Approved therapies (openFDA)"),
+        fmt_records("research_agent", "RESEARCH AGENT — Scientific literature (PubMed)"),
+        fmt_records("clinical_trial_agent", "CLINICAL TRIAL AGENT — Active trials (ClinicalTrials.gov)"),
+        fmt_records("competition_agent", "COMPETITION AGENT — Competitive landscape"),
+        fmt_records("trend_agent", "TREND AGENT — Research momentum (PubMed trends)"),
+    ])
+
+    return f"""You are a pharmaceutical research intelligence analyst specializing in therapeutic opportunity identification.
+
+Analyze the following data from 6 specialist AI agents for the therapeutic area: {therapeutic_area}
+
+{sections}
+
+Based on this cross-source intelligence, identify and rank the TOP 5 therapeutic opportunities.
+For each opportunity, consider: disease burden, existing treatment gaps, scientific evidence strength,
+research momentum, competitive landscape, and unmet medical need.
+
+Respond ONLY with a valid JSON object in this exact format (no other text before or after):
+{{
+  "opportunities": [
+    {{
+      "name": "Specific opportunity name (e.g. 'KRAS G12C targeted therapy for CRC')",
+      "score": 85,
+      "rationale": "2-3 sentence evidence-based rationale explaining WHY this ranks highly",
+      "key_evidence": ["evidence point 1", "evidence point 2", "evidence point 3"],
+      "dimension_scores": {{
+        "unmet_medical_need": 90,
+        "disease_burden": 85,
+        "existing_treatment_gap": 80,
+        "scientific_evidence": 75,
+        "research_momentum": 70,
+        "competitive_landscape": 65
+      }}
+    }}
+  ]
+}}
+
+Return ONLY the JSON. No markdown, no explanation, no preamble."""
+
+
+def _invoke_bedrock(prompt: str) -> str:
+    client = boto3.client("bedrock-runtime", region_name=_REGION)
+    response = client.converse(
+        modelId=_MODEL_ID,
+        messages=[{"role": "user", "content": [{"text": prompt}]}],
+        inferenceConfig={"maxTokens": 2048},
+    )
+    return response["output"]["message"]["content"][0]["text"]
+
+
+def _parse_llm_response(text: str, therapeutic_area: str) -> dict:
+    text = text.strip()
+    # Strip markdown code fences if present
+    if text.startswith("```"):
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+    text = text.strip()
+
+    parsed = json.loads(text)
+    opportunities = parsed.get("opportunities", [])
+
+    # Normalise scores to ensure they are numeric
+    for opp in opportunities:
+        opp["score"] = float(opp.get("score", 0))
+        for k, v in opp.get("dimension_scores", {}).items():
+            opp["dimension_scores"][k] = float(v)
+
+    return {"opportunities": opportunities}
+
+
+# ---------------------------------------------------------------------------
+# Deterministic fallback (used only when Bedrock is unavailable)
+# ---------------------------------------------------------------------------
+
+def _score_deterministic(therapeutic_area: str, by_agent: dict) -> dict:
     disease = by_agent.get("disease_agent", {})
     treatment = by_agent.get("treatment_agent", {})
     research = by_agent.get("research_agent", {})
@@ -77,79 +173,37 @@ def lambda_handler(event, context):
     n_trials = len(trial_records)
     sponsors = {r.get("sponsor") for r in trial_records if r.get("sponsor")}
 
-    # Each dimension is scored 0-100 from a countable signal. Saturating
-    # divisors are deliberately conservative -- they are demo-calibrated, not
-    # validated, which is exactly why the real scorer must be an agent.
     dims = {
-        "disease_burden": _saturate(n_burden, 10),
-        "existing_treatment_gap": 100 - _saturate(n_drugs, 25),
-        "scientific_evidence": _saturate(n_papers, 30),
-        "research_momentum": _saturate(n_papers, 30),
-        "competitive_landscape": 100 - _saturate(len(sponsors), 15),
-        # No countable proxy for unmet need without reasoning over the burden
-        # text; approximate it as burden weighted against available therapies.
-        "unmet_medical_need": _mean(
-            _saturate(n_burden, 10), 100 - _saturate(n_drugs, 25)
-        ),
+        "disease_burden": _sat(n_burden, 10),
+        "existing_treatment_gap": 100 - _sat(n_drugs, 25),
+        "scientific_evidence": _sat(n_papers, 30),
+        "research_momentum": _sat(n_papers, 30),
+        "competitive_landscape": 100 - _sat(len(sponsors), 15),
+        "unmet_medical_need": (_sat(n_burden, 10) + (100 - _sat(n_drugs, 25))) / 2,
     }
 
-    weights = _weights()
+    weights = _DEFAULT_WEIGHTS
     score = round(sum(dims[k] * weights.get(k, 0) for k in dims), 1)
 
-    area = (
-        disease.get("therapeutic_area")
-        or research.get("therapeutic_area")
-        or "Unknown"
-    )
-
-    missing = [a for a in ("disease_agent", "treatment_agent", "research_agent",
-                           "clinical_trial_agent") if a not in by_agent]
-    errored = [a for a, v in by_agent.items() if v.get("error")]
-
-    opportunity = {
-        "name": f"{area} — evidence-signal composite",
-        "score": score,
-        "method": "deterministic_fallback",
-        "rationale": (
-            f"Scored from countable signals: {n_burden} burden record(s), "
-            f"{n_drugs} approved-label record(s), {n_papers} publication(s), "
-            f"{n_trials} trial(s) across {len(sponsors)} distinct sponsor(s). "
-            f"Treatment-gap and competition dimensions are inverse-scored, so "
-            f"fewer existing therapies and fewer active sponsors raise the score."
-        ),
-        "dimension_scores": {k: round(v, 1) for k, v in dims.items()},
-        "supporting_evidence": {
-            "disease_burden": f"disease_agent: {n_burden} record(s)",
-            "existing_treatment_gap": f"treatment_agent: {n_drugs} label(s)",
-            "scientific_evidence": f"research_agent: {n_papers} publication(s)",
-            "research_momentum": f"research_agent: publication count (no date analysis in fallback)",
-            "competitive_landscape": f"clinical_trial_agent: {len(sponsors)} sponsor(s)",
-            "unmet_medical_need": "derived: burden vs. available therapies",
-        },
-        "key_uncertainties": [
-            "Scored by record counts, not by reasoning over record content.",
-            "Saturating divisors are demo-calibrated and not validated.",
-            "research_momentum duplicates scientific_evidence: assessing real "
-            "momentum needs publication-date analysis the fallback does not do.",
-        ]
-        + ([f"Agent output missing: {', '.join(missing)}"] if missing else [])
-        + ([f"Agent returned an error: {', '.join(errored)}"] if errored else []),
-    }
-
     return {
-        "opportunities": [opportunity],
-        "method": "deterministic_fallback",
-        "agents_seen": sorted(by_agent),
-        "disclaimer": DISCLAIMER,
+        "opportunities": [{
+            "name": f"{therapeutic_area} — evidence-signal composite",
+            "score": score,
+            "method": "deterministic_fallback",
+            "rationale": (
+                f"Deterministic fallback: {n_burden} disease records, "
+                f"{n_drugs} drug labels, {n_papers} publications, "
+                f"{n_trials} trials across {len(sponsors)} sponsors."
+            ),
+            "key_evidence": [
+                f"{n_papers} PubMed publications retrieved",
+                f"{n_trials} active clinical trials found",
+                f"{n_drugs} existing drug labels in FDA database",
+            ],
+            "dimension_scores": {k: round(v, 1) for k, v in dims.items()},
+        }],
     }
 
 
-def _saturate(value: int, full: int) -> float:
-    """Map a count onto 0-100, saturating at `full`."""
-    if full <= 0:
-        return 0.0
-    return min(100.0, 100.0 * value / full)
-
-
-def _mean(*values: float) -> float:
-    return sum(values) / len(values) if values else 0.0
+def _sat(value: int, full: int) -> float:
+    return min(100.0, 100.0 * value / full) if full > 0 else 0.0
